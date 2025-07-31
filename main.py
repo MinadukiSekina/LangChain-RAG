@@ -1,14 +1,14 @@
-from typing import Annotated, Literal
-
 import bs4
 from langchain import hub
 from langchain_community.document_loaders import WebBaseLoader
 from langchain_core.documents import Document
+from langchain_core.messages import BaseMessage, SystemMessage
+from langchain_core.tools import tool
 from langchain_core.vectorstores import InMemoryVectorStore
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langgraph.graph import START, StateGraph
-from pydantic import BaseModel
+from langgraph.graph import END, MessagesState, StateGraph
+from langgraph.prebuilt import ToolNode, tools_condition
 from typing_extensions import TypedDict
 
 from src.my_package.environment.env_loader import load_env
@@ -29,19 +29,6 @@ docs = loader.load()
 text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
 all_splits = text_splitter.split_documents(docs)
 
-# クエリ構築のために要素を追加
-total_documents = len(all_splits)
-third = total_documents // 3
-
-for i, document in enumerate(all_splits):
-    if i < third:
-        document.metadata["section"] = "beginning"
-    elif i < 2 * third:
-        document.metadata["section"] = "middle"
-    else:
-        document.metadata["section"] = "end"
-# 要素の追加ここまで
-
 embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
 vector_store = InMemoryVectorStore(embeddings)
 
@@ -57,55 +44,93 @@ _ = vector_store.add_documents(documents=all_splits)
 prompt = hub.pull("rlm/rag-prompt")
 
 
-# クエリ構築用のstate
-class Search(TypedDict):
-    """Search query."""
-
-    query: Annotated[str, ..., "Search query to run."]
-    section: Annotated[
-        Literal["beginning", "middle", "end"],
-        ...,
-        "Section to query.",
-    ]
-
-
 # Define state for application
 class State(TypedDict):
     question: str
-    query: Search
     context: list[Document]
     answer: str
 
 
-# クエリ構築用：ユーザーのクエリを解析
-def analyze_query(state: State) -> dict[str, dict | BaseModel]:
-    structured_llm = llm.with_structured_output(Search)
-    query = structured_llm.invoke(state["question"])
-    print(query)
-    return {"query": query}
+# Step 1: Generate an AIMessage that may include a tool-call to be sent.
+def query_or_respond(state: MessagesState) -> dict[str, list[BaseMessage]]:
+    """Generate tool call for retrieval or respond."""
+    llm_with_tools = llm.bind_tools([retrieve])
+    response = llm_with_tools.invoke(state["messages"])
+    # MessagesState appends messages to state instead of overwriting
+    return {"messages": [response]}
 
 
 # Define application steps
-def retrieve(state: State) -> dict[str, list[Document]]:
-    query = state["query"]
-    retrieved_docs = vector_store.similarity_search(
-        query["query"],
-        filter=lambda doc: doc.metadata.get("section") == query["section"],
+@tool(response_format="content_and_artifact")
+def retrieve(query: str) -> tuple[str, list[Document]]:
+    """Retrieve information related to a query."""
+    retrieved_docs = vector_store.similarity_search(query, k=2)
+    serialized = "\n\n".join(
+        (f"Source: {doc.metadata}\nContent: {doc.page_content}") for doc in retrieved_docs
     )
-    return {"context": retrieved_docs}
+    return serialized, retrieved_docs
 
 
-def generate(state: State) -> dict[str, str | list[str | dict]]:
-    docs_content = "\n\n".join(doc.page_content for doc in state["context"])
-    messages = prompt.invoke({"question": state["question"], "context": docs_content})
-    response = llm.invoke(messages)
-    return {"answer": response.content}
+# Step 2: Execute the retrieval.
+tools = ToolNode([retrieve])
+
+
+# Step 3: Generate a response using the retrieved content.
+def generate(state: MessagesState) -> dict[str, list[BaseMessage]]:
+    """Generate answer."""
+    # Get generated ToolMessages
+    recent_tool_messages = []
+    for message in reversed(state["messages"]):
+        if message.type == "tool":
+            recent_tool_messages.append(message)
+        else:
+            break
+    tool_messages = recent_tool_messages[::-1]
+
+    # Format into prompt
+    docs_content = "\n\n".join(doc.content for doc in tool_messages)
+    system_message_content = (
+        "You are an assistant for question-answering tasks. "
+        "Use the following pieces of retrieved context to answer "
+        "the question. If you don't know the answer, say that you "
+        "don't know. Use three sentences maximum and keep the "
+        "answer concise."
+        "\n\n"
+        f"{docs_content}"
+    )
+    conversation_messages = [
+        message
+        for message in state["messages"]
+        if message.type in ("human", "system") or (message.type == "ai" and not message.tool_calls)
+    ]
+    prompt = [SystemMessage(system_message_content), *conversation_messages]
+
+    # Run
+    response = llm.invoke(prompt)
+    return {"messages": [response]}
 
 
 # Compile application and test
-graph_builder = StateGraph(State).add_sequence([analyze_query, retrieve, generate])
-graph_builder.add_edge(START, "analyze_query")
+graph_builder = StateGraph(MessagesState)
+graph_builder.add_node(query_or_respond)
+graph_builder.add_node(tools)
+graph_builder.add_node(generate)
+
+graph_builder.set_entry_point("query_or_respond")
+graph_builder.add_conditional_edges(
+    "query_or_respond",
+    tools_condition,
+    {END: END, "tools": "tools"},
+)
+graph_builder.add_edge("tools", "generate")
+graph_builder.add_edge("generate", END)
+
 graph = graph_builder.compile()
 
-response = graph.invoke({"question": "What is Task Decomposition?"})
-print(response["answer"])
+input_message = "Hello"
+
+for step in graph.stream(
+    {"messages": [{"role": "user", "content": input_message}]},
+    stream_mode="values",
+):
+    step["messages"][-1].pretty_print()
