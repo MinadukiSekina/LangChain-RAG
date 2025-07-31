@@ -26,3 +26,7 @@ def load_env() -> None:
 
     if not os.environ.get("GOOGLE_API_KEY"):
         os.environ["GOOGLE_API_KEY"] = getpass.getpass("Enter API key for Google Gemini: ")
+
+    # Set USER_AGENT for web scraping requests
+    if not os.environ.get("USER_AGENT"):
+        os.environ["USER_AGENT"] = "LangChain-RAG-Bot/1.0 (Educational Project)"
